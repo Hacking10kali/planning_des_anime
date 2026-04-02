@@ -1,0 +1,39 @@
+name: Scraper Planning Anime-Sama
+
+on:
+  schedule:
+    # Tous les jours à 05h00 UTC (avant l'ouverture de journée Paris 07h00)
+    - cron: "0 5 * * *"
+  workflow_dispatch:
+
+jobs:
+  scrape-planning:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install playwright aiohttp firebase-admin
+
+      - name: Install Playwright browsers
+        run: playwright install chromium --with-deps
+
+      # Le fichier serviceAccountKey.json est injecté depuis le secret GitHub
+      - name: Write Firebase credentials
+        run: echo '${{ secrets.FIREBASE_SERVICE_ACCOUNT }}' > serviceAccountKey.json
+
+      - name: Run planning scraper
+        run: python scraper_planning.py
+
+      # Nettoyage du fichier de credentials (bonne pratique sécurité)
+      - name: Clean up credentials
+        if: always()
+        run: rm -f serviceAccountKey.json
