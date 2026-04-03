@@ -1,375 +1,344 @@
+#!/usr/bin/env python3
 """
-scraper_planning.py
--------------------
-Scrape le planning hebdomadaire de anime-sama.to et l'envoie dans Firestore.
-
-Structure Firestore :
-  planning/{YYYY-MM-DD} -> {
-    "jour":    "Lundi",
-    "date":    "2026-04-06",
-    "animes":  [ { ...infos..., "release_timestamp": <ISO 8601 UTC> } ]
-  }
-
-L'heure est stockee en UTC pur (timestamp ISO 8601).
-Le client convertit selon son propre fuseau horaire.
+Scraper Anime-Sama Planning - Version Corrigée
+==============================================
+Basé sur le script qui fonctionne avec les bons sélecteurs
 """
 
 import asyncio
-import re
-import time
-from datetime import datetime, timezone, timedelta
+import json
+import logging
+from datetime import datetime
 from pathlib import Path
-from zoneinfo import ZoneInfo
-
+from typing import List, Dict, Optional
 import aiohttp
-import firebase_admin
-from firebase_admin import credentials, firestore
-from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
+from playwright.async_api import async_playwright, Page
+
+# Configuration du logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='[%(asctime)s][%(levelname)s] %(message)s',
+    datefmt='%Mm%Ss'
+)
+logger = logging.getLogger(__name__)
+
+# Configuration
+URL_BASE = "https://anime-sama.to"
+OUTPUT_DIR = Path("/home/claude/anime_planning_output")
+OUTPUT_DIR.mkdir(exist_ok=True)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  CONFIG — modifier uniquement cette section si le site change
-# ══════════════════════════════════════════════════════════════════════════════
-
-URL_BASE           = "https://anime-sama.to"   # <- changer ici si le domaine change
-FIREBASE_CRED_PATH = Path(__file__).parent / "serviceAccountKey.json"
-JIKAN_BASE         = "https://api.jikan.moe/v4"
-JIKAN_DELAY        = 0.5   # secondes entre chaque appel Jikan (rate limit)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  LOGGING
-# ══════════════════════════════════════════════════════════════════════════════
-
-_start = time.time()
-
-def log(msg: str, level: str = "INFO"):
-    elapsed = int(time.time() - _start)
-    print(f"[{elapsed//60:02d}m{elapsed%60:02d}s][{level}] {msg}", flush=True)
-
-def warn(msg): log(msg, "WARN")
-def err(msg):  log(msg, "ERROR")
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  FIREBASE
-# ══════════════════════════════════════════════════════════════════════════════
-
-def init_firebase():
-    if not firebase_admin._apps:
-        cred = credentials.Certificate(str(FIREBASE_CRED_PATH))
-        firebase_admin.initialize_app(cred)
-    return firestore.client()
-
-
-def _firebase_retry(fn, retries=3):
-    """Execute fn() avec backoff exponentiel en cas d'erreur Firebase."""
-    for attempt in range(retries):
-        try:
-            return fn()
-        except Exception as e:
-            if attempt == retries - 1:
-                raise
-            wait = 2 ** attempt
-            warn(f"Firebase erreur (tentative {attempt+1}/{retries}) : {e} — retry dans {wait}s")
-            time.sleep(wait)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  MAPPING JOURS FR
-# ══════════════════════════════════════════════════════════════════════════════
-
-JOURS_FR = {
-    "lundi":    0,
-    "mardi":    1,
-    "mercredi": 2,
-    "jeudi":    3,
-    "vendredi": 4,
-    "samedi":   5,
-    "dimanche": 6,
-}
-
-
-def next_weekday_date(jour_fr: str, reference: datetime):
+async def resolve_ids(session: aiohttp.ClientSession, titre: str) -> Dict[str, Optional[str]]:
     """
-    Retourne la date correspondant au jour donne dans la semaine courante.
-    `reference` doit etre en UTC.
+    Résout les IDs MAL et IMDB pour un anime donné
+    
+    Args:
+        session: Session aiohttp
+        titre: Titre de l'anime
+    
+    Returns:
+        Dict avec mal_id et imdb_id
     """
-    jour_clean = jour_fr.strip().lower()
-    jour_clean = (jour_clean
-                  .replace("e", "e").replace("e", "e").replace("e", "e")
-                  .replace("\u00e9", "e").replace("\u00e8", "e").replace("\u00ea", "e"))
-
-    target_weekday = JOURS_FR.get(jour_clean)
-    if target_weekday is None:
-        warn(f"Jour inconnu : '{jour_fr}' (clean: '{jour_clean}')")
-        return None
-
-    today           = reference.date()
-    current_weekday = today.weekday()   # lundi=0, dimanche=6
-    delta           = target_weekday - current_weekday
-    return today + timedelta(days=delta)
-
-
-def build_utc_timestamp(date, heure_str: str):
-    """
-    Convertit une heure Paris (Europe/Paris) en timestamp UTC ISO 8601.
-    Ex : date=2026-04-06, heure_str="18h30" -> "2026-04-06T16:30:00+00:00"
-    """
-    if not heure_str or heure_str.lower() in ("heure inconnue", "inconnu", ""):
-        return None
-
-    heure_str = re.sub(r"[hH]", ":", heure_str).strip()
-    match = re.search(r"(\d{1,2}):(\d{2})", heure_str)
-    if not match:
-        return None
-
-    hour, minute = int(match.group(1)), int(match.group(2))
-    paris_tz = ZoneInfo("Europe/Paris")
-    dt_paris = datetime(date.year, date.month, date.day, hour, minute, tzinfo=paris_tz)
-    return dt_paris.astimezone(timezone.utc).isoformat()
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  IDs EXTERNES
-# ══════════════════════════════════════════════════════════════════════════════
-
-async def get_mal_id(session: aiohttp.ClientSession, titre: str):
+    ids = {"mal_id": None, "imdb_id": None}
+    
     try:
-        async with session.get(
-            f"{JIKAN_BASE}/anime",
-            params={"q": titre, "limit": 1},
-            timeout=aiohttp.ClientTimeout(total=10)
-        ) as resp:
-            if resp.status != 200:
-                return None
-            data    = await resp.json()
-            results = data.get("data", [])
-            if results:
-                mal_id = results[0].get("mal_id")
-                log(f"MAL : {titre} -> {mal_id}")
-                return mal_id
+        # Recherche sur Jikan (API MyAnimeList)
+        search_url = f"https://api.jikan.moe/v4/anime"
+        params = {"q": titre, "limit": 1}
+        
+        async with session.get(search_url, params=params, timeout=10) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                if data.get("data") and len(data["data"]) > 0:
+                    anime = data["data"][0]
+                    ids["mal_id"] = str(anime.get("mal_id"))
+                    
+                    # IMDB n'est pas toujours disponible dans Jikan
+                    # Il faudrait une autre API pour ça
+                    logger.debug(f"✓ MAL ID trouvé pour '{titre}': {ids['mal_id']}")
+            else:
+                logger.warning(f"Jikan API error {resp.status} pour '{titre}'")
+                
+    except asyncio.TimeoutError:
+        logger.warning(f"Timeout lors de la recherche pour '{titre}'")
     except Exception as e:
-        warn(f"Jikan erreur '{titre}' : {e}")
-    return None
+        logger.warning(f"Erreur lors de la résolution des IDs pour '{titre}': {e}")
+    
+    return ids
 
 
-async def get_imdb_id(session: aiohttp.ClientSession, titre: str):
+async def scrape_planning_page(page: Page, session: aiohttp.ClientSession) -> List[Dict]:
+    """
+    Extrait le planning depuis la page
+    
+    Args:
+        page: Page Playwright
+        session: Session aiohttp pour les requêtes API
+    
+    Returns:
+        Liste des jours avec leurs animes
+    """
+    logger.info("📅 Extraction du planning...")
+    planning_data = []
+    
+    # Attendre que les éléments soient chargés avec plusieurs stratégies
     try:
-        query = titre.replace(" ", "_")
-        url   = f"https://v2.sg.media-imdb.com/suggestion/x/{query}.json"
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-            if resp.status != 200:
-                return None
-            data = await resp.json(content_type=None)
-            for r in data.get("d", []):
-                imdb_id = r.get("id", "")
-                if imdb_id.startswith("tt"):
-                    log(f"IMDB : {titre} -> {imdb_id}")
-                    return imdb_id
+        # Stratégie 1: Attendre le sélecteur principal
+        logger.info("Attente de div.fadeJours...")
+        await page.wait_for_selector("div.fadeJours", timeout=15000, state='visible')
+        
+        # Stratégie 2: Attendre que le contenu soit stable (pas de nouvelles cartes)
+        logger.info("Attente de stabilisation du contenu...")
+        await asyncio.sleep(2)
+        
+        # Stratégie 3: Vérifier qu'on a au moins une carte
+        await page.wait_for_selector("div.anime-card-premium", timeout=5000, state='visible')
+        
     except Exception as e:
-        warn(f"IMDB erreur '{titre}' : {e}")
-    return None
-
-
-async def resolve_ids(session: aiohttp.ClientSession, titre: str) -> dict:
-    mal_id = await get_mal_id(session, titre)
-    if mal_id:
-        return {"mal_id": mal_id, "imdb_id": None}
-    warn(f"MAL non trouve pour '{titre}', tentative IMDB...")
-    imdb_id = await get_imdb_id(session, titre)
-    return {"mal_id": None, "imdb_id": imdb_id}
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  SCRAPING — Planning
-# ══════════════════════════════════════════════════════════════════════════════
-
-async def scrape_planning(page, session: aiohttp.ClientSession) -> list[dict]:
-    log("Extraction du planning...")
-    now_utc = datetime.now(timezone.utc)
-    result  = []
-
+        logger.error(f"❌ Timeout en attendant le contenu dynamique: {e}")
+        
+        # Debug: Afficher les sélecteurs disponibles
+        available_divs = await page.evaluate("""
+            () => {
+                const divs = Array.from(document.querySelectorAll('div[class]'));
+                return divs.slice(0, 20).map(d => d.className);
+            }
+        """)
+        logger.error(f"Classes div disponibles: {available_divs}")
+        
+        return []
+    
+    # Récupérer tous les jours
     jours = await page.query_selector_all("div.fadeJours")
-    log(f"{len(jours)} jour(s) trouve(s) dans le planning.")
-
-    for jour_el in jours:
-        titre_elem = await jour_el.query_selector("h2.titreJours")
+    logger.info(f"✓ Trouvé {len(jours)} jour(s)")
+    
+    for idx, jour in enumerate(jours, 1):
+        # Extraire le titre du jour
+        titre_elem = await jour.query_selector("h2.titreJours")
         titre_jour = (await titre_elem.inner_text()).strip() if titre_elem else "Jour Inconnu"
-
-        target_date = next_weekday_date(titre_jour, now_utc)
-        date_iso    = target_date.isoformat() if target_date else None
-
-        jour_entry = {
-            "jour":   titre_jour,
-            "date":   date_iso,
-            "animes": [],
+        
+        logger.info(f"Traitement: {titre_jour}")
+        
+        jour_data = {
+            "jour": titre_jour,
+            "animes": []
         }
-
-        cartes = await jour_el.query_selector_all("div.anime-card-premium")
-        for carte in cartes:
-            titre_elem = await carte.query_selector(".card-title")
-            titre      = (await titre_elem.inner_text()).strip() if titre_elem else "Titre Inconnu"
-
-            heure_elem = await carte.query_selector(".info-text.font-bold")
-            heure      = (await heure_elem.inner_text()).strip() if heure_elem else ""
-
-            saison = "Saison Inconnue"
-            for info in await carte.query_selector_all(".info-text"):
-                cls = await info.get_attribute("class")
-                if cls and "font-bold" not in cls:
-                    saison = (await info.inner_text()).strip()
-                    break
-
-            badge_elem = await carte.query_selector(".badge-text")
-            badge      = (await badge_elem.inner_text()).strip() if badge_elem else "Inconnu"
-
-            langues = []
-            if await carte.query_selector('img[title="VF"]'):     langues.append("VF")
-            if await carte.query_selector('img[title="VOSTFR"]'): langues.append("VOSTFR")
-
-            # Timestamp UTC
-            release_timestamp = None
-            if target_date and heure:
-                release_timestamp = build_utc_timestamp(target_date, heure)
-
-            # IDs
-            ids = await resolve_ids(session, titre)
-            await asyncio.sleep(JIKAN_DELAY)
-
-            jour_entry["animes"].append({
-                "titre":             titre,
-                "heure_paris":       heure,
-                "release_timestamp": release_timestamp,
-                "saison":            saison,
-                "format":            badge,
-                "langue":            " & ".join(langues) if langues else "Inconnue",
-                "mal_id":            ids["mal_id"],
-                "imdb_id":           ids["imdb_id"],
-            })
-
-        log(f"{titre_jour} ({date_iso}) -> {len(jour_entry['animes'])} anime(s)")
-        result.append(jour_entry)
-
-    return result
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  FIRESTORE UPLOAD
-# ══════════════════════════════════════════════════════════════════════════════
-
-def upload_planning(db, planning: list[dict]) -> None:
-    log("Upload vers Firestore...")
-    planning_ref = db.collection("planning")
-
-    for jour in planning:
-        date_id = jour.get("date")
-        if not date_id:
-            warn(f"Pas de date pour '{jour['jour']}', ignore.")
-            continue
-
-        doc_data = {
-            "jour":       jour["jour"],
-            "date":       date_id,
-            "animes":     jour["animes"],
-            "updated_at": datetime.now(timezone.utc).isoformat(),
-        }
-
-        _firebase_retry(lambda: planning_ref.document(date_id).set(doc_data))
-        log(f"planning/{date_id} -> {len(jour['animes'])} anime(s)")
-
-    log("Upload termine.")
+        
+        # Récupérer toutes les cartes d'anime pour ce jour
+        cartes = await jour.query_selector_all("div.anime-card-premium")
+        logger.info(f"  → {len(cartes)} anime(s) trouvé(s)")
+        
+        for carte_idx, carte in enumerate(cartes, 1):
+            try:
+                # Extraire le titre
+                titre_elem = await carte.query_selector(".card-title")
+                titre = (await titre_elem.inner_text()).strip() if titre_elem else "Titre Inconnu"
+                
+                # Extraire l'heure de sortie
+                heure_elem = await carte.query_selector(".info-text.font-bold")
+                heure = (await heure_elem.inner_text()).strip() if heure_elem else "Heure Inconnue"
+                
+                # Extraire la saison
+                saison = "Saison Inconnue"
+                info_elements = await carte.query_selector_all(".info-text")
+                for info in info_elements:
+                    cls = await info.get_attribute("class")
+                    if cls and "font-bold" not in cls:
+                        saison = (await info.inner_text()).strip()
+                        break
+                
+                # Extraire le format (badge)
+                badge_elem = await carte.query_selector(".badge-text")
+                badge = (await badge_elem.inner_text()).strip() if badge_elem else "Inconnu"
+                
+                # Extraire les langues disponibles
+                langues = []
+                if await carte.query_selector('img[title="VF"]'):
+                    langues.append("VF")
+                if await carte.query_selector('img[title="VOSTFR"]'):
+                    langues.append("VOSTFR")
+                
+                # Résolution des IDs (avec rate limiting)
+                ids = await resolve_ids(session, titre)
+                await asyncio.sleep(0.5)  # Respecter les limites de l'API Jikan
+                
+                # Ajouter l'anime au jour
+                anime_data = {
+                    "titre": titre,
+                    "heure_sortie": heure,
+                    "saison": saison,
+                    "format": badge,
+                    "langue": " & ".join(langues) if langues else "Inconnue",
+                    "mal_id": ids["mal_id"],
+                    "imdb_id": ids["imdb_id"],
+                }
+                
+                jour_data["animes"].append(anime_data)
+                logger.debug(f"    [{carte_idx}] {titre} - {heure} ({badge})")
+                
+            except Exception as e:
+                logger.error(f"Erreur lors de l'extraction de la carte {carte_idx}: {e}")
+                continue
+        
+        planning_data.append(jour_data)
+    
+    # Statistiques
+    total_animes = sum(len(j["animes"]) for j in planning_data)
+    logger.info(f"✓ Extraction terminée: {len(planning_data)} jour(s), {total_animes} anime(s)")
+    
+    return planning_data
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  MAIN
-# ══════════════════════════════════════════════════════════════════════════════
+async def save_planning_data(planning_data: List[Dict], format: str = "json"):
+    """
+    Sauvegarde les données du planning
+    
+    Args:
+        planning_data: Données extraites
+        format: Format de sortie (json, txt)
+    """
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    if format == "json":
+        # Sauvegarde JSON
+        output_file = OUTPUT_DIR / f"planning_{timestamp}.json"
+        
+        with open(output_file, 'w', encoding='utf-8') as f:
+            json.dump(planning_data, f, ensure_ascii=False, indent=2)
+        
+        logger.info(f"💾 Données sauvegardées: {output_file}")
+        
+    elif format == "txt":
+        # Sauvegarde texte formaté
+        output_file = OUTPUT_DIR / f"planning_{timestamp}.txt"
+        
+        with open(output_file, 'w', encoding='utf-8') as f:
+            f.write("=" * 80 + "\n")
+            f.write("PLANNING ANIME-SAMA\n")
+            f.write(f"Généré le: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write("=" * 80 + "\n\n")
+            
+            for jour in planning_data:
+                f.write(f"\n{'─' * 80}\n")
+                f.write(f"{jour['jour'].upper()}\n")
+                f.write(f"{'─' * 80}\n\n")
+                
+                for anime in jour['animes']:
+                    f.write(f"  📺 {anime['titre']}\n")
+                    f.write(f"     ⏰ {anime['heure_sortie']}\n")
+                    f.write(f"     📅 {anime['saison']}\n")
+                    f.write(f"     🎬 {anime['format']}\n")
+                    f.write(f"     🌐 {anime['langue']}\n")
+                    if anime['mal_id']:
+                        f.write(f"     🔗 MAL: https://myanimelist.net/anime/{anime['mal_id']}\n")
+                    f.write("\n")
+        
+        logger.info(f"💾 Rapport texte sauvegardé: {output_file}")
+    
+    return output_file
+
 
 async def main():
-    db = init_firebase()
-    log(f"START — URL_BASE = {URL_BASE}")
-
-    async with aiohttp.ClientSession() as session:
-        async with async_playwright() as pw:
-            browser = await pw.chromium.launch(
-                headless=True,
-                args=[
-                    "--no-sandbox",
-                    "--disable-setuid-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-gpu",
-                ],
-            )
-            context = await browser.new_context(
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/124.0.0.0 Safari/537.36"
-                ),
-                locale="fr-FR",
-                timezone_id="Europe/Paris",
-            )
-
-            page = await context.new_page()
-
-            # Bloque les ressources inutiles pour accelerer le chargement
-            await page.route(
-                "**/*.{png,jpg,jpeg,gif,webp,woff,woff2,ttf,mp4,mp3}",
-                lambda r: r.abort()
-            )
-
-            # ── Chargement de la page avec fallback de strategies ─────────────
-            log(f"Navigation vers {URL_BASE}/...")
-            loaded = False
-            for strategy in ("networkidle", "domcontentloaded", "load"):
+    """Fonction principale"""
+    start_time = datetime.now()
+    logger.info(f"🚀 START — URL_BASE = {URL_BASE}")
+    
+    async with async_playwright() as p:
+        # Lancer le navigateur
+        logger.info("Lancement du navigateur Chromium...")
+        browser = await p.chromium.launch(
+            headless=True,
+            args=['--no-sandbox', '--disable-setuid-sandbox']
+        )
+        
+        # Créer un contexte avec un user agent réaliste
+        context = await browser.new_context(
+            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            viewport={'width': 1920, 'height': 1080}
+        )
+        
+        page = await context.new_page()
+        
+        # Session HTTP pour les requêtes API
+        async with aiohttp.ClientSession() as session:
+            try:
+                # Navigation vers la page
+                logger.info(f"Navigation vers {URL_BASE}...")
+                
+                # Essayer différentes stratégies de chargement
+                response = None
+                strategies = ['domcontentloaded', 'networkidle']
+                
+                for strategy in strategies:
+                    try:
+                        logger.info(f"Tentative avec wait_until='{strategy}'...")
+                        response = await page.goto(
+                            URL_BASE, 
+                            wait_until=strategy, 
+                            timeout=45000
+                        )
+                        if response and response.ok:
+                            logger.info(f"✓ Page chargée avec '{strategy}' (status: {response.status})")
+                            break
+                    except Exception as e:
+                        logger.warning(f"Échec avec '{strategy}': {e}")
+                        if strategy == strategies[-1]:
+                            raise
+                
+                # Attendre un peu pour le JavaScript
+                logger.info("Attente de l'exécution JavaScript...")
+                await asyncio.sleep(3)
+                
+                if response and response.ok:
+                    logger.info(f"✓ Page chargée (status: {response.status})")
+                    
+                    # Vérifier la redirection
+                    if page.url != URL_BASE:
+                        logger.warning(f"Redirection: {URL_BASE} → {page.url}")
+                    
+                    # Extraire le planning
+                    planning_data = await scrape_planning_page(page, session)
+                    
+                    if planning_data:
+                        # Sauvegarder dans les deux formats
+                        await save_planning_data(planning_data, "json")
+                        await save_planning_data(planning_data, "txt")
+                        
+                        # Afficher un résumé
+                        logger.info("\n" + "=" * 80)
+                        logger.info("RÉSUMÉ DU PLANNING")
+                        logger.info("=" * 80)
+                        for jour in planning_data:
+                            logger.info(f"{jour['jour']}: {len(jour['animes'])} anime(s)")
+                        logger.info("=" * 80)
+                    else:
+                        logger.error("❌ Aucune donnée extraite")
+                else:
+                    logger.error(f"❌ Erreur HTTP: {response.status if response else 'No response'}")
+                    
+            except Exception as e:
+                logger.error(f"❌ Erreur fatale: {e}", exc_info=True)
+                
+                # Sauvegarder un snapshot pour debug
                 try:
-                    await page.goto(
-                        f"{URL_BASE}/",
-                        wait_until=strategy,
-                        timeout=60000
-                    )
-                    loaded = True
-                    log(f"Page chargee (strategie: {strategy})")
-                    break
-                except Exception as e:
-                    warn(f"Strategie '{strategy}' echouee : {e}")
-
-            if not loaded:
-                err("Impossible de charger la page apres toutes les strategies.")
+                    screenshot = OUTPUT_DIR / "error_screenshot.png"
+                    await page.screenshot(path=str(screenshot))
+                    logger.info(f"📸 Screenshot sauvegardé: {screenshot}")
+                    
+                    html_snapshot = OUTPUT_DIR / "error_page.html"
+                    content = await page.content()
+                    with open(html_snapshot, 'w', encoding='utf-8') as f:
+                        f.write(content)
+                    logger.info(f"💾 HTML sauvegardé: {html_snapshot}")
+                except:
+                    pass
+            
+            finally:
                 await browser.close()
-                return
-
-            # ── Attente du planning avec 3 tentatives ────────────────────────
-            planning_found = False
-            for attempt in range(3):
-                try:
-                    await page.wait_for_selector("div.fadeJours", timeout=30000)
-                    planning_found = True
-                    log("div.fadeJours trouve !")
-                    break
-                except PlaywrightTimeoutError:
-                    warn(f"Tentative {attempt+1}/3 : div.fadeJours non trouve, attente 5s...")
-                    await page.wait_for_timeout(5000)
-
-            if not planning_found:
-                # Dump HTML pour diagnostiquer ce qui est vraiment present
-                html = await page.content()
-                err("Planning introuvable apres 3 tentatives.")
-                err(f"HTML snapshot (500 chars) : {html[:500]}")
-                await browser.close()
-                return
-
-            planning = await scrape_planning(page, session)
-            await browser.close()
-
-    if planning:
-        total_animes = sum(len(j["animes"]) for j in planning)
-        log(f"{len(planning)} jour(s) | {total_animes} anime(s) scrapes")
-        upload_planning(db, planning)
-    else:
-        warn("Aucune donnee de planning recuperee.")
-
-    log("DONE.")
+    
+    # Temps d'exécution
+    duration = (datetime.now() - start_time).total_seconds()
+    logger.info(f"✓ Terminé en {duration:.1f}s")
 
 
 if __name__ == "__main__":
