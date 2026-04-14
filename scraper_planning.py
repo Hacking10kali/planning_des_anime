@@ -1,140 +1,124 @@
         
 # ── Standard Library ─────────────────────────────
-import json
+
 import asyncio
+import json
+import aiohttp
 import re
 from datetime import datetime
 from pathlib import Path
 
-# ── HTTP async ───────────────────────────────────
-import aiohttp
+from playwright.async_api import async_playwright
 
-# ── Browser automation ───────────────────────────
-from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
-
-# ── Firebase Admin SDK ───────────────────────────
 import firebase_admin
 from firebase_admin import credentials, firestore
-# ── FIREBASE ─────────────────────────
-
-def init_firebase():
-    if not firebase_admin._apps:
-        cred = credentials.Certificate("serviceAccountKey.json")
-        firebase_admin.initialize_app(cred)
-    return firestore.client()
 
 
-# ── SAVE JSON ────────────────────────
+# =========================
+# CONFIG
+# =========================
+URL = "https://anime-sama.to"  # adapte si besoin
+OUTPUT_DIR = Path("anime_planning_output")
+OUTPUT_DIR.mkdir(exist_ok=True)
 
-def save_json(data, filename):
-    Path("data").mkdir(exist_ok=True)
-    with open(f"data/{filename}", "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
+# =========================
+# FIREBASE INIT (optionnel)
+# =========================
+# ⚠️ Si tu n'as pas encore mis le fichier credentials.json,
+# commente cette partie pour tester le scraping seul
+
+try:
+    cred = credentials.Certificate("credentials.json")
+    firebase_admin.initialize_app(cred)
+    db = firestore.client()
+except Exception:
+    db = None
 
 
-# ── EXTRACTION EPISODE (planning) ───
-
-def extract_episode(text_list):
-    for text in text_list:
-        match = re.search(r"(?:ep|episode)\s*(\d+)", text.lower())
-        if match:
-            return int(match.group(1))
-    return None
-
-
-# ── SCRAPE PLANNING ─────────────────
-
+# =========================
+# SCRAPING LOGIC
+# =========================
 async def scrape_planning(page):
-    planning_data = []
+    print("📡 Chargement de la page...")
 
-    jours = await page.query_selector_all("div.fadeJours")
+    await page.goto(URL, wait_until="networkidle")
 
-    for jour in jours:
-        titre_elem = await jour.query_selector("h2.titreJours")
-        jour_nom = (await titre_elem.inner_text()).strip()
+    # 🔥 important : laisser le JS finir
+    await page.wait_for_timeout(3000)
 
-        jour_data = {"jour": jour_nom, "animes": []}
+    # ❌ NE PAS attendre visible (cause timeout)
+    elements = await page.query_selector_all("div.fadeJours")
 
-        cartes = await jour.query_selector_all("div.anime-card-premium")
+    print(f"🔎 Elements trouvés: {len(elements)}")
 
-        for carte in cartes:
-            titre = (await carte.query_selector(".card-title")).inner_text()
-            titre = (await titre).strip()
+    results = []
 
-            heure_elem = await carte.query_selector(".info-text.font-bold")
-            heure = (await heure_elem.inner_text()).strip() if heure_elem else "?"
+    for el in elements:
+        try:
+            text = await el.inner_text()
 
-            infos = await carte.query_selector_all(".info-text")
-            texts = [(await i.inner_text()).strip() for i in infos]
+            if not text.strip():
+                continue
 
-            # saison
-            saison = next((t for t in texts if "saison" in t.lower()), "Inconnue")
-
-            # épisode (🔥 ajout)
-            episode_num = extract_episode(texts)
-
-            # format
-            badge_elem = await carte.query_selector(".badge-text")
-            format_ = (await badge_elem.inner_text()).strip() if badge_elem else "?"
-
-            # langue
-            langues = []
-            if await carte.query_selector('img[title="VF"]'):
-                langues.append("VF")
-            if await carte.query_selector('img[title="VOSTFR"]'):
-                langues.append("VOSTFR")
-
-            jour_data["animes"].append({
-                "titre": titre,
-                "heure": heure,
-                "saison": saison,
-                "episode": {
-                    "numero": episode_num,
-                    "label": f"EP {episode_num}" if episode_num else None
-                },
-                "format": format_,
-                "langue": " & ".join(langues) if langues else "Inconnue"
+            results.append({
+                "text": text.strip(),
+                "scraped_at": datetime.utcnow().isoformat()
             })
 
-        planning_data.append(jour_data)
+        except Exception as e:
+            print("⚠️ erreur élément:", e)
 
-    return planning_data
-
-
-# ── UPLOAD FIREBASE ─────────────────
-
-def upload_planning(planning):
-    db = init_firebase()
-
-    doc_ref = db.collection("planning").document("weekly")
-
-    doc_ref.set({
-        "updated_at": datetime.utcnow().isoformat(),
-        "jours": planning
-    })
-
-    print("🔥 Planning envoyé sur Firebase !")
+    return results
 
 
-# ── MAIN ────────────────────────────
+# =========================
+# SAVE LOCAL
+# =========================
+def save_local(data):
+    file = OUTPUT_DIR / "planning.json"
 
+    with open(file, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+    print(f"💾 Sauvegardé localement: {file}")
+
+
+# =========================
+# FIREBASE SAVE
+# =========================
+def save_firebase(data):
+    if db is None:
+        print("⚠️ Firebase non initialisé, skip")
+        return
+
+    for item in data:
+        db.collection("anime_planning").add(item)
+
+    print("🔥 Données envoyées à Firebase")
+
+
+# =========================
+# MAIN
+# =========================
 async def main():
-    url = "https://anime-sama.to/"
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
 
-    async with aiohttp.ClientSession():
-        async with async_playwright() as pw:
-            browser = await pw.chromium.launch(headless=True)
-            page = await browser.new_page()
+        page = await browser.new_page()
 
-            await page.goto(url)
-            await page.wait_for_selector("div.fadeJours")
+        try:
+            data = await scrape_planning(page)
 
-            planning = await scrape_planning(page)
+            print(f"✅ Scraping terminé: {len(data)} items")
 
+            save_local(data)
+            save_firebase(data)
+
+        except Exception as e:
+            print("❌ ERREUR GLOBAL:", e)
+
+        finally:
             await browser.close()
-
-    save_json(planning, "planning.json")
-    upload_planning(planning)
 
 
 if __name__ == "__main__":
