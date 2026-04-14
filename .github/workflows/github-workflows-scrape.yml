@@ -2,57 +2,70 @@ name: Scrape Anime Planning
 
 on:
   schedule:
-    # Exécuter tous les jours à 6h UTC (ajustez selon vos besoins)
     - cron: '0 6 * * *'
-  workflow_dispatch:  # Permet l'exécution manuelle
+  workflow_dispatch:
   push:
     branches: [ main ]
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    
+
     steps:
+    # ── Checkout ───────────────────────────────
     - name: Checkout repository
       uses: actions/checkout@v4
-    
+
+    # ── Python ─────────────────────────────────
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
         python-version: '3.11'
-    
+        cache: 'pip'
+
+    # ── Install dependencies ───────────────────
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install playwright aiohttp
-        playwright install chromium
-        playwright install-deps
-    
+        pip install -r requirements.txt
+
+    # ── Cache Playwright (TRÈS IMPORTANT) ──────
+    - name: Cache Playwright browsers
+      uses: actions/cache@v4
+      with:
+        path: ~/.cache/ms-playwright
+        key: playwright-${{ runner.os }}
+
+    # ── Install Playwright browser ─────────────
+    - name: Install Playwright Chromium
+      run: playwright install chromium
+
+    # ── Run scraper ─────────────────────────────
     - name: Run scraper
       env:
-        # Variables d'environnement optionnelles
         ANIME_SAMA_URL: https://anime-sama.to
         OUTPUT_DIR: ./anime_planning_output
         HEADLESS: true
         LOG_LEVEL: INFO
       run: |
         python scraper_planning.py
-    
-    - name: Upload planning data as artifact
+
+    # ── Upload artifacts ────────────────────────
+    - name: Upload planning data
       uses: actions/upload-artifact@v4
-      if: always()  # Uploader même en cas d'erreur
+      if: always()
       with:
         name: anime-planning-${{ github.run_number }}
-        path: |
-          anime_planning_output/*.json
-          anime_planning_output/*.txt
-          anime_planning_output/*.png
-          anime_planning_output/*.html
+        path: anime_planning_output/
         retention-days: 30
-    
+
+    # ── Commit changes ──────────────────────────
     - name: Commit and push if changed
       run: |
         git config --global user.name 'GitHub Actions'
         git config --global user.email 'actions@github.com'
         git add anime_planning_output/
-        git diff --quiet && git diff --staged --quiet || (git commit -m "Update anime planning - $(date +'%Y-%m-%d %H:%M:%S')" && git push)
+        git diff --quiet && git diff --staged --quiet || (
+          git commit -m "Update anime planning $(date +'%Y-%m-%d %H:%M:%S')" 
+          && git push
+        )     
