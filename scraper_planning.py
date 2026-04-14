@@ -1,17 +1,19 @@
         
-import asyncio
+# ── Standard Library ─────────────────────────────
 import json
 import re
 from datetime import datetime
 from pathlib import Path
 
+# ── HTTP async ───────────────────────────────────
 import aiohttp
-from playwright.async_api import async_playwright
 
+# ── Browser automation ───────────────────────────
+from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
+
+# ── Firebase Admin SDK ───────────────────────────
 import firebase_admin
 from firebase_admin import credentials, firestore
-
-
 # ── FIREBASE ─────────────────────────
 
 def init_firebase():
