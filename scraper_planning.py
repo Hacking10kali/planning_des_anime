@@ -1,12 +1,13 @@
         
                                 import asyncio
 import json
-import aiohttp
 import re
 from datetime import datetime
 from pathlib import Path
 
+import aiohttp
 from playwright.async_api import async_playwright
+
 import firebase_admin
 from firebase_admin import credentials, firestore
 
